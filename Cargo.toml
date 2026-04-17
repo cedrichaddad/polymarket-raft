@@ -1,0 +1,61 @@
+[package]
+name = "raft"
+version = "0.1.0"
+edition = "2021"
+description = "RAFT: Resolution-Aligned Fee-Aware Trading for Polymarket BTC minute markets"
+license = "MIT"
+
+[lib]
+name = "raft"
+path = "src/lib.rs"
+
+[[bin]]
+name = "raft"
+path = "src/bin/raft.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+
+# Serialization / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# HTTP
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+url = "2"
+
+# Errors / logging
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Parquet / Arrow
+arrow = "54"
+parquet = "54"
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+rand = "0.8"
+dashmap = "6"
+parking_lot = "0.12"
+smallvec = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+tempfile = "3"
+approx = "0.5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

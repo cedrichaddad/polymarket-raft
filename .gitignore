@@ -1,0 +1,9 @@
+/target
+/data
+Cargo.lock
+*.pyc
+__pycache__/
+.venv/
+*.parquet
+*.tmp
+.DS_Store

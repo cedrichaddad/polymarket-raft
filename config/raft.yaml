@@ -1,0 +1,47 @@
+# RAFT configuration — mirrors Appendix B of the design doc.
+mode: research
+
+rtds:
+  url: wss://ws-live-data.polymarket.com
+  ping_interval_ms: 5000
+  reconnect:
+    initial_backoff_ms: 250
+    max_backoff_ms: 5000
+    jitter: true
+  subscriptions:
+    - topic: crypto_prices
+      type: update
+      filters: btcusdt
+    - topic: crypto_prices_chainlink
+      type: "*"
+      filters: '{"symbol":"btc/usd"}'
+
+market_ws:
+  enabled: true
+  reconnect_initial_backoff_ms: 250
+  reconnect_max_backoff_ms: 5000
+  url: wss://ws-subscriptions-clob.polymarket.com/ws/market
+
+hydration:
+  refresh_secs: 60
+  gamma_url: https://gamma-api.polymarket.com
+
+storage:
+  parquet_root: ./data/raw
+  roll_interval_secs: 300
+  roll_max_mb: 64
+
+action_gates:
+  binance_stale_ms: 2000
+  chainlink_stale_ms: 5000
+  disable_taker_if_chainlink_stale: true
+  disable_all_if_both_stale: true
+
+strategy:
+  market_family: btc_5m
+  state_interval_ms: 1000
+  retrieval_k: 64
+  retrieval_ef: 128
+  center_prob_low: 0.40
+  center_prob_high: 0.60
+  min_spread_ticks_for_maker: 2
