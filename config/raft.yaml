@@ -11,7 +11,7 @@ rtds:
   subscriptions:
     - topic: crypto_prices
       type: update
-      filters: btcusdt
+      filters: '{"symbol":"btcusdt"}'
     - topic: crypto_prices_chainlink
       type: "*"
       filters: '{"symbol":"btc/usd"}'

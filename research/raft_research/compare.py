@@ -34,8 +34,24 @@ def compare(sigma_per_sec: float = 5e-4) -> pd.DataFrame:
     cal_path = derived("calibrator.json")
     if cal_path.exists():
         data = json.loads(cal_path.read_text())
-        bp = np.asarray(data["isotonic_breakpoints"])
-        df["p_star"] = np.interp(df["p_0"].to_numpy(), bp[:, 0], bp[:, 1])
+        if "lomo_folds" in data:
+            # LOMO calibrator: apply per-market-fold breakpoints.
+            p_star = np.full(len(df), np.nan, dtype=float)
+            for mid, fold in data["lomo_folds"].items():
+                mask = df["market_id"].to_numpy() == mid
+                if not mask.any():
+                    continue
+                bp = np.asarray(fold["isotonic_breakpoints"])
+                if len(bp) == 0:
+                    p_star[mask] = df["p_0"].to_numpy()[mask]
+                else:
+                    p_star[mask] = np.interp(df["p_0"].to_numpy()[mask], bp[:, 0], bp[:, 1])
+            remaining = np.isnan(p_star)
+            p_star[remaining] = df["p_0"].to_numpy()[remaining]
+            df["p_star"] = p_star
+        else:
+            bp = np.asarray(data["isotonic_breakpoints"])
+            df["p_star"] = np.interp(df["p_0"].to_numpy(), bp[:, 0], bp[:, 1])
     else:
         df["p_star"] = df["p_0"]
 

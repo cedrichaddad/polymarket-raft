@@ -56,7 +56,8 @@ def _install_views(con: duckdb.DuckDBPyConnection) -> None:
             """
         )
 
-    # trades
+    # trades — create an empty typed view when no files exist so STATE_SQL always
+    # has the relation available (the LEFT JOIN already handles zero-trade runs).
     trades_glob = _glob(root, "trades")
     if trades_glob:
         con.execute(
@@ -72,6 +73,22 @@ def _install_views(con: duckdb.DuckDBPyConnection) -> None:
                 f2 AS size,
                 body_json AS trade_id
             FROM read_parquet('{trades_glob}', union_by_name=true);
+            """
+        )
+    else:
+        con.execute(
+            """
+            CREATE OR REPLACE VIEW market_trade_events AS
+            SELECT
+                0::BIGINT   AS ts_exchange_ms,
+                0::BIGINT   AS ts_recv_local_ms,
+                ''::VARCHAR AS market_id,
+                ''::VARCHAR AS asset_id,
+                ''::VARCHAR AS side_aggressor,
+                0.0::DOUBLE AS price,
+                0.0::DOUBLE AS size,
+                ''::VARCHAR AS trade_id
+            WHERE FALSE;
             """
         )
 

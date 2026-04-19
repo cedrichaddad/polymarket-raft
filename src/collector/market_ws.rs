@@ -87,25 +87,54 @@ impl MarketWsClient {
             .context("market subscribe")?;
         info!(target: "mktws", "subscribed to {} assets", assets.len());
 
-        while let Some(msg) = read.next().await {
-            match msg {
-                Ok(Message::Text(t)) => {
-                    if let Err(e) = self.handle_text(&t) {
-                        warn!(target: "mktws", error = %e, "parse error");
+        // Keepalive ping every 10s — server drops silent connections after ~2 min.
+        let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let ping_task = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+            tick.tick().await; // consume immediate tick
+            loop {
+                tick.tick().await;
+                if ping_tx.send(()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        loop {
+            tokio::select! {
+                maybe_msg = read.next() => {
+                    match maybe_msg {
+                        Some(Ok(Message::Text(t))) => {
+                            if let Err(e) = self.handle_text(&t) {
+                                warn!(target: "mktws", error = %e, "parse error");
+                            }
+                        }
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = write.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(Message::Close(_))) | None => {
+                            ping_task.abort();
+                            return Ok(());
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => {
+                            ping_task.abort();
+                            return Err(anyhow!("mkt ws read error: {e}"));
+                        }
                     }
                 }
-                Ok(Message::Ping(p)) => {
-                    let _ = write.send(Message::Pong(p)).await;
+                _ = ping_rx.recv() => {
+                    if let Err(e) = write.send(Message::Ping(vec![])).await {
+                        ping_task.abort();
+                        return Err(anyhow!("ping send failed: {e}"));
+                    }
                 }
-                Ok(Message::Close(_)) => return Ok(()),
-                Ok(_) => {}
-                Err(e) => return Err(anyhow!("mkt ws read error: {e}")),
             }
         }
-        Ok(())
     }
 
     fn handle_text(&self, text: &str) -> Result<()> {
+        debug!(target: "mktws", raw = %&text[..text.len().min(400)], "recv");
         // Responses can be either a single object or an array of events.
         let v: Value = serde_json::from_str(text).context("decode market json")?;
         match v {
@@ -120,7 +149,13 @@ impl MarketWsClient {
     }
 
     fn handle_value(&self, v: Value) {
-        let Some(event_type) = v.get("event_type").and_then(|x| x.as_str()) else {
+        // Polymarket uses "event_type" in market-channel messages; fall back to "type".
+        let event_type = v
+            .get("event_type")
+            .or_else(|| v.get("type"))
+            .and_then(|x| x.as_str());
+        let Some(event_type) = event_type else {
+            debug!(target: "mktws", raw = %v, "no event_type field, skipping");
             return;
         };
         let market_id = v
@@ -138,12 +173,14 @@ impl MarketWsClient {
             .and_then(|x| x.as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| x.as_u64()));
 
         match event_type {
-            "book" | "price_change" => {
+            "book" => {
+                // Full book snapshot: bids/asks arrays at the top level.
                 let (best_bid, best_ask) = extract_best_levels(&v);
                 let spread = match (best_bid, best_ask) {
                     (Some(b), Some(a)) => Some(a - b),
                     _ => None,
                 };
+                debug!(target: "mktws", event = event_type, market = %market_id, asset = %asset_id, bid = ?best_bid, ask = ?best_ask, "book event");
                 let ev = MarketBookEvent {
                     ts_exchange_ms,
                     ts_recv_local_ms: now_ms(),
@@ -157,11 +194,70 @@ impl MarketWsClient {
                 };
                 let _ = self.bus.send(ExternalEvent::MarketBook(ev));
             }
+            "price_change" => {
+                // price_change wraps a `price_changes` array — one entry per token.
+                // Each entry carries the new best_bid/best_ask AND the trade that
+                // caused the change (price, side, size).
+                let entries = v
+                    .get("price_changes")
+                    .and_then(|x| x.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let recv_ms = now_ms();
+                for entry in &entries {
+                    let entry_asset = entry
+                        .get("asset_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let best_bid = entry.get("best_bid").and_then(json_to_f64);
+                    let best_ask = entry.get("best_ask").and_then(json_to_f64);
+                    let spread = match (best_bid, best_ask) {
+                        (Some(b), Some(a)) => Some(a - b),
+                        _ => None,
+                    };
+                    debug!(target: "mktws", market = %market_id, asset = %entry_asset, bid = ?best_bid, ask = ?best_ask, "price_change book");
+                    let book_ev = MarketBookEvent {
+                        ts_exchange_ms,
+                        ts_recv_local_ms: recv_ms,
+                        market_id: market_id.clone(),
+                        asset_id: entry_asset.clone(),
+                        event_type: "price_change".to_string(),
+                        best_bid,
+                        best_ask,
+                        spread,
+                        book_json: entry.to_string(),
+                    };
+                    let _ = self.bus.send(ExternalEvent::MarketBook(book_ev));
+
+                    // Extract the trade that caused this price change.
+                    let price = entry.get("price").and_then(json_to_f64).unwrap_or(0.0);
+                    let size  = entry.get("size").and_then(json_to_f64).unwrap_or(0.0);
+                    let side_aggressor = entry.get("side").and_then(|x| x.as_str()).and_then(parse_side);
+                    let trade_id = entry.get("hash").and_then(|x| x.as_str()).map(String::from);
+                    if size > 0.0 {
+                        debug!(target: "mktws", market = %market_id, price, size, "price_change trade");
+                        let trade_ev = MarketTradeEvent {
+                            ts_exchange_ms,
+                            ts_recv_local_ms: recv_ms,
+                            market_id: market_id.clone(),
+                            asset_id: entry_asset,
+                            price,
+                            size,
+                            side_aggressor,
+                            trade_id,
+                        };
+                        let _ = self.bus.send(ExternalEvent::MarketTrade(trade_ev));
+                    }
+                }
+            }
             "last_trade_price" | "trade" => {
+                // Standalone trade events (rare on this endpoint but keep the handler).
                 let price = v.get("price").and_then(json_to_f64).unwrap_or(0.0);
                 let size = v.get("size").and_then(json_to_f64).unwrap_or(0.0);
                 let side_aggressor = v.get("side").and_then(|x| x.as_str()).and_then(parse_side);
                 let trade_id = v.get("trade_id").and_then(|x| x.as_str()).map(String::from);
+                debug!(target: "mktws", event = event_type, market = %market_id, price, size, "trade event");
                 let ev = MarketTradeEvent {
                     ts_exchange_ms,
                     ts_recv_local_ms: now_ms(),
@@ -175,7 +271,7 @@ impl MarketWsClient {
                 let _ = self.bus.send(ExternalEvent::MarketTrade(ev));
             }
             other => {
-                debug!(target: "mktws", event = other, "ignored event type");
+                warn!(target: "mktws", event = other, "unhandled event type");
             }
         }
     }
@@ -257,10 +353,22 @@ mod tests {
     }
 
     #[test]
-    fn price_change_reports_single_side() {
-        let v = json!({"event_type": "price_change", "price": "0.55", "side": "BUY"});
-        let (b, a) = extract_best_levels(&v);
-        assert_eq!(b, Some(0.55));
-        assert_eq!(a, None);
+    fn price_change_entry_best_levels_parse() {
+        // Simulate a single entry from the price_changes array.
+        let entry = json!({
+            "asset_id": "abc",
+            "best_bid": "0.32",
+            "best_ask": "0.33",
+            "price": "0.32",
+            "side": "BUY",
+            "size": "112.07",
+            "hash": "deadbeef"
+        });
+        let bid = entry.get("best_bid").and_then(json_to_f64);
+        let ask = entry.get("best_ask").and_then(json_to_f64);
+        assert!((bid.unwrap() - 0.32).abs() < 1e-9);
+        assert!((ask.unwrap() - 0.33).abs() < 1e-9);
+        let size = entry.get("size").and_then(json_to_f64);
+        assert!((size.unwrap() - 112.07).abs() < 1e-6);
     }
 }

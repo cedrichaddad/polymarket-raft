@@ -97,7 +97,8 @@ ORDER BY b.market_id, b.state_ts_s;
 
 def build(output: str | None = None) -> int:
     con = connect()
-    # Fail loudly if upstream views are missing — that means no raw data yet.
+    # Fail loudly if the core views are missing — that means no raw data yet.
+    # market_trade_events is optional (duck.py creates an empty fallback view).
     for view in ("rtds_prices", "market_book_events", "market_meta"):
         exists = con.execute(
             "SELECT COUNT(*) FROM duckdb_views() WHERE view_name = ?", [view]

@@ -63,9 +63,9 @@ impl RestHydrator {
 
     pub async fn refresh_once(&self) -> Result<usize> {
         // Gamma `events` endpoint filtered for BTC minute markets.
-        // We fetch both 5m and 15m series; filters may need adjustment as Gamma changes.
+        // We query the bitcoin tag to get a more targeted result set.
         let url = format!(
-            "{}/events?tag_slug=crypto&active=true&closed=false&limit=100",
+            "{}/events?tag_slug=bitcoin&active=true&closed=false&limit=100",
             self.cfg.gamma_url.trim_end_matches('/')
         );
         let resp = self.http.get(&url).send().await.context("gamma get")?;
@@ -84,10 +84,16 @@ impl RestHydrator {
                 .cloned()
                 .unwrap_or_default();
             for m in markets {
+                // Log what we see before filtering so we can tune infer_window.
+                let slug = m.get("slug").and_then(|x| x.as_str()).unwrap_or("-");
+                let title = m.get("question").and_then(|x| x.as_str()).unwrap_or("-");
+                debug!(target: "hydrator", slug, title = &title[..title.len().min(80)], "candidate market");
                 let Some(meta) = parse_market(&m) else { continue };
                 if !is_btc_minute(&meta) {
                     continue;
                 }
+                let dur_s = meta.end_ts_ms.saturating_sub(meta.start_ts_ms) / 1000;
+                debug!(target: "hydrator", market = %meta.market_id, window = %meta.window_type, dur_s, "matched btc minute market");
                 asset_set.push(meta.asset_yes_id.clone());
                 asset_set.push(meta.asset_no_id.clone());
                 seen.insert(meta.market_id.clone());
@@ -132,13 +138,22 @@ fn parse_market(m: &Value) -> Option<MarketMetaEvent> {
     let asset_yes_id = tokens[0].as_str()?.to_string();
     let asset_no_id = tokens[1].as_str()?.to_string();
 
-    // Window type inferred from slug/title if explicit fields are absent.
     let slug = m.get("slug").and_then(|x| x.as_str()).unwrap_or_default();
     let title = m.get("question").and_then(|x| x.as_str()).unwrap_or_default();
-    let window_type = infer_window(slug, title).unwrap_or_else(|| "unknown".to_string());
 
-    let start_ts_ms = parse_ts(m.get("startDate")).unwrap_or(0);
-    let end_ts_ms = parse_ts(m.get("endDate")).unwrap_or(0);
+    // The canonical BTC up/down minute market slug encodes the window start time
+    // and duration: btc-updown-{5m|15m}-{unix_seconds}. The Gamma API's
+    // startDate/endDate span the full batch lifecycle (~24h), NOT the 5/15-minute
+    // prediction window. We derive the correct timestamps from the slug.
+    let (window_type, start_ts_ms, end_ts_ms) =
+        if let Some((wt, s, e)) = parse_btc_updown_slug(slug) {
+            (wt, s, e)
+        } else {
+            let wt = infer_window(slug, title).unwrap_or_else(|| "unknown".to_string());
+            let s = parse_ts(m.get("startDate")).unwrap_or(0);
+            let e = parse_ts(m.get("endDate")).unwrap_or(0);
+            (wt, s, e)
+        };
 
     let fees_enabled = m
         .get("enableOrderBook")
@@ -171,6 +186,27 @@ fn parse_market(m: &Value) -> Option<MarketMetaEvent> {
 fn parse_ts(v: Option<&Value>) -> Option<u64> {
     let s = v?.as_str()?;
     DateTime::parse_from_rfc3339(s).ok().map(|t| t.timestamp_millis() as u64)
+}
+
+/// Parse the canonical BTC up/down slug format: `btc-updown-{5m|15m}-{unix_seconds}`.
+/// Returns `(window_type, start_ts_ms, end_ts_ms)` on match, None otherwise.
+///
+/// The Gamma API's startDate/endDate cover the full ~24-hour market lifecycle;
+/// the actual prediction window is encoded only in the slug timestamp.
+fn parse_btc_updown_slug(slug: &str) -> Option<(String, u64, u64)> {
+    // Split into exactly 4 parts on the first 3 hyphens.
+    let mut it = slug.splitn(4, '-');
+    if it.next() != Some("btc") { return None; }
+    if it.next() != Some("updown") { return None; }
+    let window = it.next()?;
+    let ts_str = it.next()?;
+    let (window_type, duration_ms): (&str, u64) = match window {
+        "5m"  => ("btc_5m",  5  * 60 * 1_000),
+        "15m" => ("btc_15m", 15 * 60 * 1_000),
+        _     => return None,  // 4h and other windows are not our target
+    };
+    let unix_s: u64 = ts_str.parse().ok()?;
+    Some((window_type.to_string(), unix_s * 1_000, unix_s * 1_000 + duration_ms))
 }
 
 fn infer_window(slug: &str, title: &str) -> Option<String> {
@@ -207,5 +243,23 @@ mod tests {
             Some("btc_15m".into())
         );
         assert_eq!(infer_window("eth-5m", "Eth price move"), None);
+    }
+
+    #[test]
+    fn btc_updown_slug_parses_correctly() {
+        let ts = 1776476700u64;
+        let (wt, s, e) = parse_btc_updown_slug("btc-updown-5m-1776476700").unwrap();
+        assert_eq!(wt, "btc_5m");
+        assert_eq!(s, ts * 1_000);
+        assert_eq!(e, ts * 1_000 + 300_000);
+
+        let (wt, s, e) = parse_btc_updown_slug("btc-updown-15m-1776476700").unwrap();
+        assert_eq!(wt, "btc_15m");
+        assert_eq!(e - s, 900_000);
+
+        // 4h windows should not match.
+        assert!(parse_btc_updown_slug("btc-updown-4h-1776470400").is_none());
+        // Non-btc-updown slugs should not match.
+        assert!(parse_btc_updown_slug("bitcoin-above-70k-on-april-18").is_none());
     }
 }

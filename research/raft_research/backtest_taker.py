@@ -12,6 +12,11 @@ Where:
     fill_price = market_prob + half-spread (conservative)
     fee = `taker_fee_prob` in probability units
 
+Trade deduplication: Only the **first** 1-second bar per market where the edge
+triggers counts as a trade entry.  Subsequent bars in the same market are
+ignored — they are autocorrelated snapshots of the same position, not
+independent bets.
+
 Outputs a per-trade Parquet + aggregate JSON to `data/derived/backtest_taker/`.
 
 Usage:
@@ -53,7 +58,7 @@ def run(
     df["p_0"] = fair_prob(df["chainlink_price"], df["open_ref_price"], df["tte_s"], sigma_per_sec)
 
     if calibrator_path:
-        p_star = _apply_isotonic(df["p_0"], Path(calibrator_path))
+        p_star = _apply_calibrator(df["p_0"], df["market_id"], Path(calibrator_path))
         df["p_star"] = p_star
     else:
         df["p_star"] = df["p_0"]
@@ -69,6 +74,10 @@ def run(
     df = df[df["abs_edge"] > all_in_threshold].copy()
     if df.empty:
         log.warning("no trades triggered at threshold=%s", all_in_threshold)
+
+    # ── Deduplicate: one trade per market at first edge trigger ──────────
+    df = df.sort_values(["market_id", "state_ts_ms"])
+    df = df.groupby("market_id", sort=False).first().reset_index()
 
     # Conservative fill price: cross the full half-spread.
     half_spread = (df["spread_yes"] / 2.0).clip(lower=0.0)
@@ -97,12 +106,14 @@ def run(
 
 def _summarize(df: pd.DataFrame) -> dict:
     if df.empty:
-        return {"n_trades": 0}
+        return {"n_trades": 0, "n_unique_markets": 0}
     mean = df["net_pnl"].mean()
     std = df["net_pnl"].std(ddof=1)
-    t_stat = mean / (std / np.sqrt(len(df))) if std > 0 else float("nan")
+    n = len(df)
+    t_stat = mean / (std / np.sqrt(n)) if std > 0 else float("nan")
     return {
-        "n_trades": int(len(df)),
+        "n_trades": int(n),
+        "n_unique_markets": int(df["market_id"].nunique()),
         "net_pnl_mean": float(mean),
         "net_pnl_std": float(std),
         "t_stat": float(t_stat) if not np.isnan(t_stat) else None,
@@ -111,8 +122,30 @@ def _summarize(df: pd.DataFrame) -> dict:
     }
 
 
-def _apply_isotonic(p0: pd.Series, path: Path) -> np.ndarray:
+def _apply_calibrator(p0: pd.Series, market_ids: pd.Series, path: Path) -> np.ndarray:
+    """Apply the calibrator, respecting leave-one-market-out folds if present."""
     data = json.loads(path.read_text())
+
+    # LOMO calibrator: per-market-fold breakpoints keyed by held-out market ID.
+    if "lomo_folds" in data:
+        out = np.full(len(p0), np.nan, dtype=float)
+        folds = data["lomo_folds"]
+        for mid, fold in folds.items():
+            mask = market_ids.to_numpy() == mid
+            if not mask.any():
+                continue
+            bp = np.asarray(fold["isotonic_breakpoints"])
+            if len(bp) == 0:
+                # Fallback: use raw p_0 if no breakpoints for this fold.
+                out[mask] = p0.to_numpy()[mask]
+            else:
+                out[mask] = np.interp(p0.to_numpy()[mask], bp[:, 0], bp[:, 1])
+        # Markets not in any fold: use raw p_0.
+        remaining = np.isnan(out)
+        out[remaining] = p0.to_numpy()[remaining]
+        return out
+
+    # Legacy single-fold calibrator (backward compat).
     bp = np.asarray(data["isotonic_breakpoints"])
     xs = bp[:, 0]
     ys = bp[:, 1]

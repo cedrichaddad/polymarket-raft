@@ -215,11 +215,11 @@ impl RtdsClient {
             .get("timestamp")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        let value = env
-            .payload
-            .get("value")
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| anyhow!("missing payload.value"))?;
+        // Subscription ACKs and heartbeats share the topic name but have no price.
+        let Some(value) = env.payload.get("value").and_then(|v| v.as_f64()) else {
+            debug!(target: "rtds", topic = %env.topic, "no value in payload (ack/hb), skipping");
+            return Ok(());
+        };
 
         let ts_server_ms = env.timestamp.unwrap_or_else(now_ms);
         let ts_recv_local_ms = now_ms();
