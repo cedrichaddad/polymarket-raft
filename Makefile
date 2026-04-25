@@ -25,7 +25,8 @@ SKIP_INSTALL ?= 0
 SKIP_COLLECT ?= 0
 
 .PHONY: help install build print-config collect paper build-state labels calibrate index \
-        backtest-taker backtest-maker markouts compare run-research sweep summaries clean chmod-scripts
+        backtest-taker backtest-maker markouts compare run-research sweep summaries clean chmod-scripts \
+        sizing-ablation
 
 help:
 	@echo "Targets:"
@@ -44,6 +45,7 @@ help:
 	@echo "  make compare           - compare p_0 / p_star / p_hybrid"
 	@echo "  make run-research      - end-to-end collector + pipeline"
 	@echo "  make sweep             - parameter sweep for taker + maker"
+	@echo "  make sizing-ablation   - rolling-holdout bucketed-sizing ablation"
 	@echo "  make summaries         - print current summaries"
 	@echo "  make chmod-scripts     - make helper scripts executable"
 	@echo "  make clean             - remove derived outputs"
@@ -121,6 +123,12 @@ run-research:
 
 sweep:
 	PYTHON_BIN=$(PYTHON) ./scripts/sweep_backtests.sh
+
+sizing-ablation:
+	cd research && $(PYTHON) -m raft_research.sizing_ablation \
+		--calibrator ../data/derived/calibrator.json \
+		--taker-fee-prob $(TAKER_FEE_PROB) \
+		--n-folds 4
 
 summaries:
 	@echo "==> taker"
